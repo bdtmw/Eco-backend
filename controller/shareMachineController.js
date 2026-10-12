@@ -6,6 +6,18 @@ import Transaction from '../model/withdrawals.js';
 import User from '../model/UserModel.js';
 import { sendEmail } from '../helper/emailServer.js';
 import { StatusCodes } from 'http-status-codes';
+import { isSelfOrAdmin, isValidId, isPositiveInt, escapeHtml } from '../utils/access.js';
+
+// Total shares currently held (sum, not document count)
+const countSoldShares = async (machineId, session) => {
+  const q = SharePurchase.aggregate([
+    { $match: { machine: machineId, status: 'active' } },
+    { $group: { _id: null, total: { $sum: '$numberOfShares' } } },
+  ]);
+  if (session) q.session(session);
+  const r = await q;
+  return r[0]?.total || 0;
+};
 
 // Get the special share machine
 export const getSpecialShareMachine = async (req, res) => {
@@ -24,9 +36,7 @@ export const getSpecialShareMachine = async (req, res) => {
     }
 
     // Get sold shares
-    const soldShares = await SharePurchase.countDocuments({
-      machine: specialMachine._id
-    });
+    const soldShares = await countSoldShares(specialMachine._id);
 
     // Calculate availability
     const availableShares = specialMachine.totalShares - soldShares;
@@ -54,9 +64,11 @@ export const purchaseSpecialShares = async (req, res) => {
   session.startTransaction();
 
   try {
-    const { userId, numberOfShares } = req.body;
+    const { numberOfShares } = req.body;
+    const userId = req.user._id;
 
-    if (!userId || !numberOfShares || numberOfShares < 1) {
+    if (!isPositiveInt(numberOfShares)) {
+      await session.abortTransaction();
       return res.status(StatusCodes.BAD_REQUEST).json({
         success: false,
         message: "User ID and valid number of shares are required"
@@ -90,10 +102,7 @@ export const purchaseSpecialShares = async (req, res) => {
       });
     }
 
-    const soldShares = await SharePurchase.countDocuments({
-      machine: machine._id,
-      status: "active"
-    }).session(session);
+    const soldShares = await countSoldShares(machine._id, session);
 
     const availableShares = machine.totalShares - soldShares;
 
@@ -131,13 +140,13 @@ export const purchaseSpecialShares = async (req, res) => {
       });
     }
 
-    if (balance.totalBalance < totalCost) {
+    if (balance.adminAdd < totalCost) {
       await session.abortTransaction();
       return res.status(StatusCodes.BAD_REQUEST).json({
         success: false,
         message: "Insufficient balance",
         required: totalCost,
-        available: balance.totalBalance
+        available: balance.adminAdd
       });
     }
 
@@ -334,8 +343,7 @@ export const purchaseSpecialShares = async (req, res) => {
     console.error("Share purchase error:", error);
     return res.status(StatusCodes.INTERNAL_SERVER_ERROR).json({
       success: false,
-      message: "Error purchasing shares",
-      error: error.message
+      message: "Error purchasing shares"
     });
   } finally {
     session.endSession();
@@ -424,8 +432,7 @@ export const updateAllShareProfits = async (req, res) => {
     console.error("Error updating share profits:", error);
     return res.status(StatusCodes.INTERNAL_SERVER_ERROR).json({
       success: false,
-      message: "Error updating share profits",
-      error: error.message
+      message: "Error updating share profits"
     });
   } finally {
     session.endSession();
@@ -437,10 +444,17 @@ export const getUserShareDetails = async (req, res) => {
   try {
     const { userId } = req.params;
     
-    if (!userId) {
+    if (!isValidId(userId)) {
       return res.status(StatusCodes.BAD_REQUEST).json({
         success: false,
-        message: "User ID is required"
+        message: "Valid user ID is required"
+      });
+    }
+
+    if (!isSelfOrAdmin(req, userId)) {
+      return res.status(StatusCodes.FORBIDDEN).json({
+        success: false,
+        message: "Not allowed"
       });
     }
     
@@ -507,8 +521,7 @@ export const getUserShareDetails = async (req, res) => {
     console.error("Error fetching user share details:", error);
     return res.status(StatusCodes.INTERNAL_SERVER_ERROR).json({
       success: false,
-      message: "Error retrieving share details",
-      error: error.message
+      message: "Error retrieving share details"
     });
   }
 };
@@ -524,7 +537,7 @@ export const sellSharePurchase = async (req, res) => {
     const { numberOfSharesToSell } = req.body;
     
     // Validate numberOfSharesToSell is provided and is a positive number
-    if (!numberOfSharesToSell || numberOfSharesToSell < 1) {
+    if (!isValidId(sharePurchaseId) || !isPositiveInt(numberOfSharesToSell)) {
       await session.abortTransaction();
       return res.status(StatusCodes.BAD_REQUEST).json({
         success: false,
@@ -538,10 +551,10 @@ export const sellSharePurchase = async (req, res) => {
       .populate('machine')
       .session(session);
 
-    if (!sharePurchase) {
+    if (!sharePurchase || !isSelfOrAdmin(req, sharePurchase.user?._id)) {
       await session.abortTransaction();
       return res.status(StatusCodes.NOT_FOUND).json({
-        success: false, 
+        success: false,
         message: 'Share purchase not found'
       });
     }
@@ -625,38 +638,18 @@ export const sellSharePurchase = async (req, res) => {
 
     // Send email confirmation
     try {
-      const emailData = {
-  userName: `${user.firstName} ${user.lastName}`,
-  machineName: specialMachine.machineName,
-  numberOfShares,
-  pricePerShare: specialMachine.sharePrice,
-  totalCost: numberOfShares * specialMachine.sharePrice,
-};
-
-const html = `
-  <div style="font-family:sans-serif;line-height:1.5">
-    <h2>Share Purchase Confirmation</h2>
-    <p>Hi ${emailData.userName || "there"},</p>
-    <p>Thank you for purchasing shares in <b>${emailData.machineName}</b>.</p>
-
-    <p><b>Shares Purchased:</b> ${emailData.numberOfShares}</p>
-    <p><b>Price per Share:</b> $${emailData.pricePerShare}</p>
-    <p><b>Total Cost:</b> $${emailData.totalCost}</p>
-
-    <p style="margin-top:16px;color:#555">
-      You can view your shared machines in your dashboard.
-    </p>
-  </div>
-`;
-
-await sendEmail(
-  user.email,
-  "Share Purchase Confirmation",
-  html         // <-- pass HTML string, not the object
-);
+      await sendEmail(
+        sharePurchase.user.email,
+        "Share Sale Confirmation",
+        `<div style="font-family:sans-serif;line-height:1.5">
+          <h2>Share Sale Confirmation</h2>
+          <p>Hi ${escapeHtml(sharePurchase.user.firstName) || "there"},</p>
+          <p>You sold <b>${numberOfSharesToSell}</b> share(s) of <b>${escapeHtml(sharePurchase.machine.machineName)}</b>.</p>
+          <p><b>Amount credited:</b> $${sellingPrice.toFixed(2)}</p>
+        </div>`
+      );
     } catch (emailError) {
       console.error('Email notification failed:', emailError);
-      // Continue even if email fails
     }
 
     return res.status(StatusCodes.OK).json({
@@ -688,8 +681,7 @@ await sendEmail(
     console.error('Share sale error:', error);
     return res.status(StatusCodes.INTERNAL_SERVER_ERROR).json({
       success: false,
-      message: 'Error processing share sale',
-      error: error.message
+      message: 'Error processing share sale'
     });
   } finally {
     session.endSession();

@@ -9,9 +9,12 @@ export const deleteUser = asyncHandler(async (req ,res) => {
   const { id } = req.params;
 
   try {
+    if (String(req.user._id) === String(id)) {
+      return res.status(400).json({ message: "You cannot delete your own account" });
+    }
     const user = await User.findByIdAndDelete(id);
     if (!user) {
-      res.status(404).json({ message: "User not found" });
+      return res.status(404).json({ message: "User not found" });
     }
     res.status(200).json({ message: "User deleted successfully" });
   } catch (error) {
@@ -23,7 +26,9 @@ export const deleteUser = asyncHandler(async (req ,res) => {
 
 export const getAllUsers = asyncHandler(async (req, res) => {
   try {
-    const users = await User.find({});
+    const users = await User.find({}).select(
+      "-password -otpCode -otpExpires -resetPasswordToken -resetPasswordExpires"
+    );
 
     if (users.length === 0) {
       return res.status(404).json({ message: "No users found" });
@@ -32,7 +37,7 @@ export const getAllUsers = asyncHandler(async (req, res) => {
     res.status(200).json(users);
   } catch (error) {
     console.error("Error fetching users:", error.message);
-    res.status(500).json({ message: `Server error: ${error.message}` });
+    res.status(500).json({ message: "Server error" });
   }
 });
 

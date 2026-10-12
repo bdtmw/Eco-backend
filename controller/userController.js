@@ -9,26 +9,39 @@ import { fileURLToPath } from 'url';
 import path from 'path';
 import { sendEmail } from "../helper/emailServer.js";
 import crypto from "crypto";
+import mongoose from "mongoose";
 
 // Load environment variables
 dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 
+const isStr = (v) => typeof v === "string";
+const generateOtp = () => crypto.randomInt(100000, 1000000).toString();
+const hashToken = (t) => crypto.createHash("sha256").update(t).digest("hex");
+const safeEqual = (a, b) => {
+  const x = Buffer.from(String(a));
+  const y = Buffer.from(String(b));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+};
+
 
 export const registerUser = asyncHandler(async (req, res) => {
   const { firstName, lastName, email, password, country, phoneNumber, referralCode } = req.body;
 
-  if (!firstName || !lastName || !email || !password || !country || !phoneNumber)
+  if (![firstName, lastName, email, password, country, phoneNumber].every(isStr) ||
+      !firstName || !lastName || !email || !password || !country || !phoneNumber)
     return res.status(400).json({ message: "All fields are required" });
 
   if (password.length < 6)
     return res.status(400).json({ message: "Password must be at least 6 characters long" });
 
-  const userExists = await User.findOne({ email });
+  const normalizedEmail = email.trim().toLowerCase();
+  const userExists = await User.findOne({ email: normalizedEmail });
   if (userExists) return res.status(400).json({ message: "User already exists" });
 
   let referrer = null;
   if (referralCode) {
+    if (!isStr(referralCode)) return res.status(400).json({ message: "Invalid referral code" });
     referrer = await User.findOne({ referralCode });
     if (!referrer) return res.status(400).json({ message: "Invalid referral code" });
   }
@@ -38,7 +51,7 @@ export const registerUser = asyncHandler(async (req, res) => {
   const user = await User.create({
     firstName,
     lastName,
-    email,
+    email: normalizedEmail,
     password,
     country,
     phoneNumber,
@@ -48,7 +61,7 @@ export const registerUser = asyncHandler(async (req, res) => {
   });
 
   // Generate OTP
-  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+  const otp = generateOtp();
   user.otpCode = otp;
   user.otpExpires = new Date(Date.now() + 5 * 60 * 1000);
   await user.save();
@@ -69,12 +82,14 @@ await sendEmail(
 
 export const verifyOtp = asyncHandler(async (req, res) => {
   const { email, otp } = req.body;
+  if (!isStr(email) || !isStr(otp))
+    return res.status(400).json({ message: "Email and OTP are required" });
 
-  const user = await User.findOne({ email });
-  if (!user) return res.status(400).json({ message: "User not found" });
+  const user = await User.findOne({ email: email.trim().toLowerCase() });
+  if (!user) return res.status(400).json({ message: "Invalid OTP" });
   if (user.isVerified) return res.status(400).json({ message: "Email already verified" });
 
-  if (!user.otpCode || user.otpCode !== otp)
+  if (!user.otpCode || !safeEqual(user.otpCode, otp))
     return res.status(400).json({ message: "Invalid OTP" });
 
   if (new Date(user.otpExpires) < new Date())
@@ -113,21 +128,21 @@ export const verifyOtp = asyncHandler(async (req, res) => {
 export const loginUser = asyncHandler(async (req, res) => {
   const { email, password } = req.body;
 
-  if (!email || !password)
+  if (!isStr(email) || !isStr(password) || !email || !password)
     return res.status(400).json({ message: "All fields are required" });
 
-  const user = await User.findOne({ email: email.toLowerCase() });
-  if (!user) return res.status(404).json({ message: "User not found" });
+  const user = await User.findOne({ email: email.trim().toLowerCase() });
+  if (!user) return res.status(400).json({ message: "Invalid email or password" });
+
+  const isPasswordValid = await bcrypt.compare(password, user.password);
+  if (!isPasswordValid)
+    return res.status(400).json({ message: "Invalid email or password" });
 
   // Skip verification check if user is admin
   if (user.role !== "admin" && !user.isVerified)
     return res
       .status(401)
       .json({ message: "Please verify your email before login." });
-
-  const isPasswordValid = await bcrypt.compare(password, user.password);
-  if (!isPasswordValid)
-    return res.status(400).json({ message: "Invalid email or password" });
 
   // 1) If 2FA is NOT enabled → normal login (your existing behavior)
   if (!user.twoFactorEnabled) {
@@ -161,7 +176,7 @@ export const loginUser = asyncHandler(async (req, res) => {
   }
 
   // 2) If 2FA is enabled → generate OTP, email it, NO token/cookie yet
-  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+  const otp = generateOtp();
   user.otpCode = otp;
   user.otpExpires = new Date(Date.now() + 5 * 60 * 1000); // 5 mins
   await user.save();
@@ -189,14 +204,17 @@ export const resendVerificationOtp = async (req, res) => {
   try {
     const { email } = req.body;
 
-    if (!email) {
+    if (!isStr(email) || !email) {
       return res.status(400).json({ message: "Email is required" });
     }
 
-    const user = await User.findOne({ email: email.toLowerCase() });
+    const user = await User.findOne({ email: email.trim().toLowerCase() });
 
+    // Do not reveal whether the account exists
     if (!user) {
-      return res.status(404).json({ message: "User not found" });
+      return res.status(200).json({
+        message: "If the account exists, a new verification code has been sent.",
+      });
     }
 
     // Optional: prevent resending if already verified
@@ -205,7 +223,7 @@ export const resendVerificationOtp = async (req, res) => {
     }
 
     // Generate new OTP
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    const otp = generateOtp();
     user.otpCode = otp;
     user.otpExpires = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
     await user.save();
@@ -222,7 +240,6 @@ export const resendVerificationOtp = async (req, res) => {
     console.error("Resend OTP error:", error);
     return res.status(500).json({
       message: "Failed to resend verification code.",
-      error: error.message,
     });
   }
 };
@@ -348,6 +365,13 @@ export const getMyReferrals = async (req, res) => {
   try {
     const userId = req.params.userId;
 
+    if (
+      !mongoose.Types.ObjectId.isValid(userId) ||
+      (String(req.user._id) !== String(userId) && req.user.role !== "admin")
+    ) {
+      return res.status(403).json({ message: "Not allowed" });
+    }
+
     let referrals = await User.find({ referralId: userId })
       .select("firstName lastName email createdAt deposit_count discount referralStatus");
 
@@ -364,33 +388,29 @@ export const getMyReferrals = async (req, res) => {
     });
 
   } catch (error) {
-    return res.status(500).json({
-      message: "Error fetching referrals",
-      error: error.message,
-    });
+    return res.status(500).json({ message: "Error fetching referrals" });
   }
 };
 
 
 
 export const updatePassword = asyncHandler(async (req, res) => {
-  const { userId, currentPassword, newPassword } = req.body;
+  const { currentPassword, newPassword } = req.body;
 
-  if (!userId || !currentPassword || !newPassword)
+  if (!isStr(currentPassword) || !isStr(newPassword) || !currentPassword || !newPassword)
     return res.status(400).json({ message: "All fields are required" });
 
-  const user = await User.findById(userId);
+  if (newPassword.length < 6)
+    return res.status(400).json({ message: "Password must be at least 6 characters long" });
+
+  const user = await User.findById(req.user._id);
   if (!user) return res.status(404).json({ message: "User not found" });
-console.log(currentPassword)
-  // Compare current password
+
   const valid = await bcrypt.compare(currentPassword, user.password);
   if (!valid)
     return res.status(400).json({ message: "Current password is incorrect" });
 
-  // ❗ HASH THE NEW PASSWORD BEFORE SAVING
-  console.log(newPassword)
-  const hashedPassword = await bcrypt.hash(newPassword, 10);
-console.log(hashedPassword)
+  // Hashed by the User model's pre-save hook
   user.password = newPassword;
   await user.save();
 
@@ -400,15 +420,21 @@ console.log(hashedPassword)
 export const forgotPassword = async (req, res) => {
   try {
     const { email } = req.body;
+    const genericResponse = {
+      message: "If an account exists for that email, a reset link has been sent.",
+    };
 
-    const user = await User.findOne({ email });
-    if (!user) return res.status(404).json({ message: "User not found" });
+    if (!isStr(email) || !email) {
+      return res.status(400).json({ message: "Email is required" });
+    }
 
-    // Create raw token
+    const user = await User.findOne({ email: email.trim().toLowerCase() });
+    if (!user) return res.status(200).json(genericResponse);
+
+    // Create raw token (emailed) and store only its hash
     const resetToken = crypto.randomBytes(32).toString("hex");
 
-    // Save token + expiry in DB
-    user.resetPasswordToken = resetToken;
+    user.resetPasswordToken = hashToken(resetToken);
     user.resetPasswordExpires = Date.now() + 10 * 60 * 1000; // 10 mins
     await user.save();
 
@@ -510,12 +536,12 @@ export const forgotPassword = async (req, res) => {
     `;
 
     await sendEmail(
-      email,
+      user.email,
       "Password Reset", // not "Password Reset Request", so it uses generic HTML branch
       html
     );
 
-    res.json({ message: "Reset link sent to email", resetToken }); // resetURL only for testing
+    res.json(genericResponse);
   } catch (error) {
     console.log("❌ Forgot password error:", error);
     res.status(500).json({ message: "Server error" });
@@ -530,12 +556,15 @@ export const resetPassword = async (req, res) => {
     // password comes from body: { password: "..." }
     const { password } = req.body;
 
-    if (!password) {
+    if (!isStr(password) || !password) {
       return res.status(400).json({ message: "Password is required" });
+    }
+    if (password.length < 6) {
+      return res.status(400).json({ message: "Password must be at least 6 characters long" });
     }
 
     const user = await User.findOne({
-      resetPasswordToken: token,
+      resetPasswordToken: hashToken(String(token)),
       resetPasswordExpires: { $gt: Date.now() }, // token not expired
     });
 
@@ -549,6 +578,8 @@ export const resetPassword = async (req, res) => {
     // Clear reset token
     user.resetPasswordToken = undefined;
     user.resetPasswordExpires = undefined;
+    user.otpCode = null;
+    user.otpExpires = null;
 
     await user.save();
 
@@ -561,15 +592,11 @@ export const resetPassword = async (req, res) => {
 
 // controllers/authController.js
 export const toggleTwoFactor = asyncHandler(async (req, res) => {
-  const { userId, enabled } = req.body;
-
-  if (!userId) {
-    return res.status(400).json({ success: false, message: "User ID required" });
-  }
+  const { enabled } = req.body;
 
   const user = await User.findByIdAndUpdate(
-    userId,
-    { twoFactorEnabled: !!enabled },
+    req.user._id,
+    { twoFactorEnabled: enabled === true || enabled === "true" },
     { new: true }
   ).select("-password");
 
@@ -579,14 +606,14 @@ export const toggleTwoFactor = asyncHandler(async (req, res) => {
 
   return res.json({
     success: true,
-    message: `Two-factor authentication ${enabled ? "enabled" : "disabled"}.`,
+    message: `Two-factor authentication ${user.twoFactorEnabled ? "enabled" : "disabled"}.`,
   });
 });
 
 export const verifyLoginOtp = asyncHandler(async (req, res) => {
   const { userId, otp } = req.body;
 
-  if (!userId || !otp)
+  if (!isStr(userId) || !isStr(otp) || !userId || !otp || !mongoose.Types.ObjectId.isValid(userId))
     return res.status(400).json({ message: "User ID and OTP are required" });
 
   const user = await User.findById(userId);
@@ -598,7 +625,7 @@ export const verifyLoginOtp = asyncHandler(async (req, res) => {
       .status(400)
       .json({ message: "No active OTP. Please login again." });
 
-  if (user.otpCode !== otp)
+  if (!safeEqual(user.otpCode, otp))
     return res.status(400).json({ message: "Invalid OTP" });
 
   if (user.otpExpires < new Date())
@@ -642,24 +669,19 @@ export const verifyLoginOtp = asyncHandler(async (req, res) => {
 export const resendLoginOtp = asyncHandler(async (req, res) => {
   const { email } = req.body;
 
-  if (!email) {
+  if (!isStr(email) || !email) {
     return res.status(400).json({ message: "Email is required" });
   }
 
-  const user = await User.findOne({ email: email.toLowerCase() });
+  const user = await User.findOne({ email: email.trim().toLowerCase() });
+  const genericResponse = { message: "If 2FA is enabled, a new code has been sent." };
 
-  if (!user) {
-    return res.status(404).json({ message: "User not found" });
-  }
-
-  if (!user.twoFactorEnabled) {
-    return res
-      .status(400)
-      .json({ message: "Two-factor authentication is not enabled." });
+  if (!user || !user.twoFactorEnabled) {
+    return res.json(genericResponse);
   }
 
   // Generate new OTP
-  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+  const otp = generateOtp();
   user.otpCode = otp;
   user.otpExpires = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
   await user.save();
@@ -673,5 +695,5 @@ export const resendLoginOtp = asyncHandler(async (req, res) => {
       .json({ message: "Failed to send OTP. Please try again." });
   }
 
-  return res.json({ message: "Login 2FA code resent to your email." });
+  return res.json(genericResponse);
 });

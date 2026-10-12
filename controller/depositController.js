@@ -34,7 +34,9 @@ const verifyNowPaymentsSignature = (body, signature) => {
     .update(sortedBody)
     .digest("hex");
 
-  return crypto.timingSafeEqual(Buffer.from(hmac), Buffer.from(signature));
+  const a = Buffer.from(hmac);
+  const b = Buffer.from(String(signature));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 };
 
 const creditUserBalance = async ({ userId, amount, paymentId, session }) => {
@@ -68,7 +70,13 @@ const creditUserBalance = async ({ userId, amount, paymentId, session }) => {
 
 export const createDeposit = async (req, res) => {
   try {
-    const { userId, amount, transactionId, dateTime, accounttype } = req.body;
+    const { transactionId, dateTime, accounttype } = req.body;
+    const userId = req.user._id;
+    const amount = Number(req.body.amount);
+
+    if (!Number.isFinite(amount) || amount <= 0 || amount > 1_000_000) {
+      return res.status(400).json({ success: false, message: "Invalid deposit amount" });
+    }
 
     let attachmentUrls = [];
 
@@ -85,7 +93,7 @@ export const createDeposit = async (req, res) => {
       transactionId,
       accounttype,
       attachment: attachmentUrls,
-      dateTime: dateTime || new Date(),
+      dateTime: new Date(),
       paymentProvider: "manual",
       paymentStatus: "pending",
     });
@@ -102,7 +110,6 @@ export const createDeposit = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Error while creating deposit",
-      error: error.message,
     });
   }
 };
@@ -243,7 +250,7 @@ export const nowPaymentsIpn = asyncHandler(async (req, res) => {
     await session.abortTransaction();
     session.endSession();
     console.error("NOWPayments IPN error:", error);
-    return res.status(500).json({ success: false, message: error.message });
+    return res.status(500).json({ success: false, message: "IPN processing failed" });
   }
 });
 

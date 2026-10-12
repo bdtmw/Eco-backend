@@ -6,8 +6,6 @@ export const protect = asyncHandler(async (req, res, next) => {
   
   try {
     let token;
-    console.log('Cookies:', req.cookies);
-    console.log('Headers:', req.headers);
     // Check cookie first
     token = req.cookies.token;
 
@@ -20,22 +18,17 @@ export const protect = asyncHandler(async (req, res, next) => {
       token = req.headers.authorization.split(" ")[1];
     }
 
-    console.log(
-      "Token source:",
-      token ? (req.cookies.token ? "cookie" : "header") : "none"
-    );
 
     if (!token) {
-      console.log("No token found in cookies or headers");
       return res.status(401).json({ message: "Not authorized, please login!" });
     }
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-    const user = await User.findById(decoded.id).select("-password");
+    const user = await User.findById(decoded.id).select("-password -otpCode -otpExpires -resetPasswordToken -resetPasswordExpires");
 
     if (!user) {
-      return res.status(404).json({ message: "User not found!" });
+      return res.status(401).json({ message: "Not authorized, token failed!" });
     }
 
     req.user = user;

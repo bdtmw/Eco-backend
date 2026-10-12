@@ -33,7 +33,11 @@ export const runProfitUpdate = async () => {
         if (!machine.user?._id) return;
         if (!machine.machine?.monthlyProfit) return;
 
-        const lastUpdate = machine.lastProfitUpdate || machine.assignedDate;
+        // Re-read inside the transaction so overlapping runs cannot pay twice
+        const fresh = await UserMachine.findById(machine._id).session(session);
+        if (!fresh || fresh.status !== 'active') return;
+
+        const lastUpdate = fresh.lastProfitUpdate || fresh.assignedDate;
         const currentDate = new Date();
         const lastUpdateTime = new Date(lastUpdate).getTime();
 
@@ -57,11 +61,11 @@ export const runProfitUpdate = async () => {
         const monthlyProfit = machine.machine.monthlyProfit;
         const profitToAdd = Number((monthlyProfit * monthsDue).toFixed(4));
 
-        machine.monthlyProfitAccumulated += profitToAdd;
-        machine.lastProfitUpdate = new Date(
+        fresh.monthlyProfitAccumulated += profitToAdd;
+        fresh.lastProfitUpdate = new Date(
           lastUpdateTime + monthsDue * 30 * 24 * 60 * 60 * 1000
         );
-        await machine.save({ session });
+        await fresh.save({ session });
 
         let userBalance = await Balance.findOne({ user: machine.user._id }).session(session);
         if (!userBalance) {
@@ -99,7 +103,7 @@ export const runProfitUpdate = async () => {
 
         normalProcessed++;
         totalPaidOut += profitToAdd;
-        console.log(`[PROFIT JOB] ✅ Paid $${profitToAdd} to ${machine.user.email}`);
+        console.log(`[PROFIT JOB] ✅ Paid $${profitToAdd} to user ${machine.user._id}`);
       });
     } catch (err) {
       console.error(`[PROFIT JOB] ❌ Machine ${machine._id} failed:`, err.message);
@@ -123,7 +127,11 @@ export const runProfitUpdate = async () => {
         if (!share.user?._id) return;
         if (!share.machine || !share.profitPerShare) return;
 
-        const lastUpdate = share.lastProfitUpdate || share.purchaseDate;
+        // Re-read inside the transaction so overlapping runs cannot pay twice
+        const freshShare = await SharePurchase.findById(share._id).session(session);
+        if (!freshShare || freshShare.status !== 'active') return;
+
+        const lastUpdate = freshShare.lastProfitUpdate || freshShare.purchaseDate;
         const currentDate = new Date();
         const lastUpdateTime = new Date(lastUpdate).getTime();
 
@@ -144,12 +152,12 @@ export const runProfitUpdate = async () => {
           return;
         }
 
-        const monthlyProfit = Number((share.profitPerShare * share.numberOfShares).toFixed(4));
+        const monthlyProfit = Number((freshShare.profitPerShare * freshShare.numberOfShares).toFixed(4));
         const profitToAdd = Number((monthlyProfit * monthsDue).toFixed(4));
 
-        share.totalProfitEarned = Number((share.totalProfitEarned + profitToAdd).toFixed(4));
-        share.lastProfitUpdate = new Date(lastUpdateTime + monthsDue * 30 * 24 * 60 * 60 * 1000);
-        await share.save({ session });
+        freshShare.totalProfitEarned = Number((freshShare.totalProfitEarned + profitToAdd).toFixed(4));
+        freshShare.lastProfitUpdate = new Date(lastUpdateTime + monthsDue * 30 * 24 * 60 * 60 * 1000);
+        await freshShare.save({ session });
 
         let userBalance = await Balance.findOne({ user: share.user._id }).session(session);
         if (!userBalance) {
@@ -174,7 +182,7 @@ export const runProfitUpdate = async () => {
           status: 'completed',
           balanceBefore: oldTotal,
           balanceAfter: userBalance.totalBalance,
-          details: `${monthsDue} month(s) profit for ${share.numberOfShares} shares of ${share.machine.machineName}`,
+          details: `${monthsDue} month(s) profit for ${freshShare.numberOfShares} shares of ${share.machine.machineName}`,
           transactionDate: currentDate,
           metadata: {
             shareId: share._id,
@@ -184,7 +192,7 @@ export const runProfitUpdate = async () => {
 
         sharesProcessed++;
         totalPaidOut += profitToAdd;
-        console.log(`[PROFIT JOB] ✅ Share $${profitToAdd} to ${share.user.email}`);
+        console.log(`[PROFIT JOB] ✅ Share $${profitToAdd} to user ${share.user._id}`);
       });
     } catch (err) {
       console.error(`[PROFIT JOB] ❌ Share ${share._id} failed:`, err.message);

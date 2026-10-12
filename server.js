@@ -36,7 +36,7 @@ const corsOptions = {
     if (allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
-      console.log("Blocked origin:", origin);
+      console.warn("Blocked origin:", origin);
       callback(new Error("Not allowed by CORS"));
     }
   },
@@ -55,32 +55,37 @@ const corsOptions = {
 // Apply CORS middleware
 app.use(cors(corsOptions));
 
-// Security headers middleware
+// Basic security headers
+app.set("trust proxy", 1);
+app.disable("x-powered-by");
 app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (allowedOrigins.includes(origin)) {
-    res.header("Access-Control-Allow-Origin", origin);
-  }
-  res.header("Access-Control-Allow-Credentials", "true");
-  res.header(
-    "Access-Control-Allow-Methods",
-    "GET,PUT,POST,DELETE,UPDATE,OPTIONS"
-  );
-  res.header(
-    "Access-Control-Allow-Headers",
-    "X-Requested-With, X-HTTP-Method-Override, Content-Type, Accept"
-  );
+  res.set({
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Strict-Transport-Security": "max-age=15552000; includeSubDomains",
+  });
+  next();
+});
 
-  if (req.method === "OPTIONS") {
-    return res.status(200).end();
+// CSRF guard: cookies are SameSite=None, so reject state-changing requests
+// whose Origin is present but not one of our allowed origins.
+app.use((req, res, next) => {
+  if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return next();
+  const origin = req.headers.origin;
+  if (origin && !allowedOrigins.includes(origin)) {
+    return res.status(403).json({ message: "Origin not allowed" });
   }
   next();
 });
 
 // Middleware
 app.use(cookieParser());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: "1mb" }));
+
+app.get("/", (req, res) => {
+  res.send("Backend is running");
+});
 
 // Dynamic route loading
 const port = process.env.PORT || 8000;
@@ -108,31 +113,5 @@ const server = async () => {
     console.error("Failed to start server:", error.message);
     process.exit(1);
   }
-  app.get("/", (req, res) => {
-  res.send("✅ Backend deployed on Vercel and running!");
-});
 };
-// In your backend, add a temp route:
-app.get('/debug-shares', async (req, res) => {
-  const shares = await SharePurchase.find({ status: 'active' }).populate('machine user');
-  const now = new Date();
-  
-  const debug = shares.map(s => {
-    const lastUpdate = s.lastProfitUpdate || s.purchaseDate;
-    const days = Math.floor((now - new Date(lastUpdate)) / (1000*60*60*24));
-    return {
-      shareId: s._id,
-      user: s.user?.email,
-      machine: s.machine?.machineName,
-      purchaseDate: s.purchaseDate,
-      lastProfitUpdate: s.lastProfitUpdate,
-      effectiveLastUpdate: lastUpdate,
-      daysSinceUpdate: days,
-      monthsDue: Math.floor(days / 30),
-      wouldBePaid: Math.floor(days / 30) >= 1,
-    };
-  });
-  
-  res.json(debug);
-});
 server();

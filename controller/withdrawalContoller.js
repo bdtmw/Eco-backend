@@ -7,38 +7,47 @@ import { sendEmail } from "../helper/emailServer.js";
 import Balance from "../model/Balance.js";
 import asyncHandler from "express-async-handler";
 import dotenv from 'dotenv';
+import { isSelfOrAdmin, isValidId, isPositiveNumber, escapeHtml } from '../utils/access.js';
 
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL; // e.g. "admin@yourdomain.com"
 
 export const createWithdrawalRequest = asyncHandler(async (req, res) => {
   const { amount, walletNumber, walletType, walletName } = req.body;
 
-  if (!amount || !walletNumber || !walletType || !walletName) {
-    return res.status(400).json({ message: "All fields are required" });
+  if (
+    !isPositiveNumber(amount) ||
+    ![walletNumber, walletType, walletName].every((v) => typeof v === "string" && v.trim())
+  ) {
+    return res.status(400).json({ message: "Valid amount and wallet details are required" });
   }
 
-  const userId = req.user._id; // user from auth middleware
-  const user = await User.findById(userId);
+  const userId = req.user._id;
+
+  // Atomic check-and-deduct: prevents negative amounts and double-spend races
+  const user = await User.findOneAndUpdate(
+    { _id: userId, mainBalance: { $gte: amount } },
+    { $inc: { mainBalance: -amount } },
+    { new: true }
+  );
 
   if (!user) {
-    return res.status(404).json({ message: "User not found" });
-  }
-  console.log(user.mainBalance, amount)
-  if (user.mainBalance < amount) {
     return res.status(400).json({ message: "Insufficient balance" });
   }
 
-  // Deduct balance temporarily (optional — or admin can deduct after approval)
-  user.mainBalance -= amount;
-  await user.save();
-
-  const withdrawal = await Withdrawal.create({
-    userId,
-    amount,
-    walletNumber,
-    walletType,
-    walletName,
-  });
+  let withdrawal;
+  try {
+    withdrawal = await Withdrawal.create({
+      userId,
+      amount,
+      walletNumber: walletNumber.trim(),
+      walletType: walletType.trim(),
+      walletName: walletName.trim(),
+    });
+  } catch (err) {
+    // Roll the deduction back if the request could not be recorded
+    await User.updateOne({ _id: userId }, { $inc: { mainBalance: amount } });
+    throw err;
+  }
 
   res.status(201).json({
     message: "Withdrawal request submitted successfully",
@@ -83,33 +92,32 @@ export const updateWithdrawalStatus = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const { status } = req.body;
 
-  // Only allow valid statuses
-  if (!["Approved", "Rejected"].includes(status)) {
-    return res.status(400).json({ message: "Invalid status value" });
+  if (!isValidId(id) || !["Approved", "Rejected"].includes(status)) {
+    return res.status(400).json({ message: "Invalid request" });
   }
 
-  // Find withdrawal request
-  const withdrawal = await Withdrawal.findById(id);
+  // Only a Pending request can transition; this makes refunds happen at most once
+  const withdrawal = await Withdrawal.findOneAndUpdate(
+    { _id: id, status: "Pending" },
+    { $set: { status } },
+    { new: true }
+  );
+
   if (!withdrawal) {
-    return res.status(404).json({ message: "Withdrawal request not found" });
+    const exists = await Withdrawal.exists({ _id: id });
+    return res.status(exists ? 409 : 404).json({
+      message: exists
+        ? "Withdrawal request has already been processed"
+        : "Withdrawal request not found",
+    });
   }
 
-  // Find user associated with withdrawal
-  const user = await User.findById(withdrawal.userId);
-  if (!user) {
-    return res.status(404).json({ message: "User not found" });
-  }
-
-  // Update logic
   if (status === "Rejected") {
-    // Refund user balance if rejected
-    user.mainBalance += withdrawal.amount;
-    await user.save();
+    await User.updateOne(
+      { _id: withdrawal.userId },
+      { $inc: { mainBalance: withdrawal.amount } }
+    );
   }
-
-  // Update withdrawal status
-  withdrawal.status = status;
-  await withdrawal.save();
 
   res.status(200).json({
     success: true,
@@ -128,25 +136,22 @@ export const requestWithdrawal = async (req, res) => {
   session.startTransaction();
 
   try {
-    const { userId, email, amount, walletAddress, network } = req.body;
+    const { amount, walletAddress, network } = req.body;
 
     // Basic validation
-    if (!email || !amount || amount <= 0 || !walletAddress || !network) {
+    if (
+      !isPositiveNumber(amount) ||
+      typeof walletAddress !== "string" || !walletAddress.trim() ||
+      typeof network !== "string" || !network.trim()
+    ) {
       await session.abortTransaction();
       return res.status(400).json({
-        message: "Email, amount, wallet address, and network are required",
+        message: "Valid amount, wallet address, and network are required",
       });
     }
 
-    // Find user (Allow userId OR email)
-    let conditions = [{ email: email.toLowerCase() }];
-    if (userId) {
-      conditions.push({ _id: userId });
-    }
-
-    const user = await User.findOne({
-      $or: conditions,
-    }).session(session);
+    // Always the authenticated user, never a client-supplied identity
+    const user = await User.findById(req.user._id).session(session);
 
     if (!user) {
       await session.abortTransaction();
@@ -161,12 +166,19 @@ export const requestWithdrawal = async (req, res) => {
       return res.status(404).json({ message: "Not Enough balance" });
     }
 
+    // Funds already committed to other pending withdrawals
+    const [pending] = await Transaction.aggregate([
+      { $match: { user: user._id, type: "withdrawal", status: "pending" } },
+      { $group: { _id: null, total: { $sum: "$amount" } } },
+    ]).session(session);
+    const availableBalance = balance.totalBalance - (pending?.total || 0);
+
     // Check balance
-    if (amount > balance.totalBalance) {
+    if (amount > availableBalance) {
       await session.abortTransaction();
       return res.status(400).json({
         message: "Withdrawal amount exceeds available balance",
-        availableBalance: balance.totalBalance,
+        availableBalance,
       });
     }
 
@@ -176,8 +188,8 @@ export const requestWithdrawal = async (req, res) => {
       amount,
       type: "withdrawal",
       status: "pending",
-      walletAddress,
-      network,
+      walletAddress: walletAddress.trim(),
+      network: network.trim(),
       balanceBefore: balance.totalBalance,
       balanceAfter: balance.totalBalance - amount,
       details: `Withdrawal request of $${amount} via ${network}`,
@@ -256,13 +268,13 @@ try {
           <p style="margin:0 0 6px;">
             <span style="font-weight:600;color:#d1d5db;">User:</span>
             <span style="margin-left:6px;color:#e5e7eb;">
-              ${fullName || user.email}
+              ${escapeHtml(fullName || user.email)}
             </span>
           </p>
           <p style="margin:0;">
             <span style="font-weight:600;color:#d1d5db;">User Email:</span>
             <span style="margin-left:6px;color:#e5e7eb;">
-              ${user.email}
+              ${escapeHtml(user.email)}
             </span>
           </p>
         </div>
@@ -287,19 +299,19 @@ try {
           <p style="margin:0 0 6px;">
             <span style="font-weight:600;color:#d1d5db;">Amount:</span>
             <span style="margin-left:6px;color:#22c55e;">
-              $${amount}
+              $${escapeHtml(amount)}
             </span>
           </p>
           <p style="margin:0 0 6px;">
             <span style="font-weight:600;color:#d1d5db;">Wallet Address:</span>
             <span style="margin-left:6px;color:#e5e7eb;word-break:break-all;">
-              ${walletAddress}
+              ${escapeHtml(walletAddress)}
             </span>
           </p>
           <p style="margin:0 0 6px;">
             <span style="font-weight:600;color:#d1d5db;">Network:</span>
             <span style="margin-left:6px;color:#e5e7eb;">
-              ${network}
+              ${escapeHtml(network)}
             </span>
           </p>
           <p style="margin:0 0 6px;">
@@ -349,14 +361,13 @@ try {
     return res.status(200).json({
       message: "Withdrawal request submitted successfully",
       transaction,
-      availableBalance: balance.totalBalance,
+      availableBalance: availableBalance - amount,
     });
   } catch (error) {
     await session.abortTransaction();
     console.error("Withdrawal request error:", error);
     return res.status(500).json({
       message: "Error processing withdrawal request",
-      error: error.message,
     });
   } finally {
     session.endSession();
@@ -373,8 +384,13 @@ export const processWithdrawalRequest = async (req, res) => {
     const { transactionId, action, adminComment } = req.body;
     const adminId = req.user._id;
 
-    if (!["approved", "rejected"].includes(action)) {
-      return res.status(400).json({ message: "Invalid action" });
+    if (!isValidId(transactionId) || !["approved", "rejected"].includes(action)) {
+      await session.abortTransaction();
+      return res.status(400).json({ message: "Invalid request" });
+    }
+    if (adminComment !== undefined && typeof adminComment !== "string") {
+      await session.abortTransaction();
+      return res.status(400).json({ message: "Invalid comment" });
     }
 
     const transaction = await Transaction.findById(transactionId)
@@ -384,6 +400,11 @@ export const processWithdrawalRequest = async (req, res) => {
     if (!transaction) {
       await session.abortTransaction();
       return res.status(404).json({ message: "Transaction not found" });
+    }
+
+    if (transaction.type !== "withdrawal") {
+      await session.abortTransaction();
+      return res.status(400).json({ message: "Not a withdrawal transaction" });
     }
 
     if (transaction.status !== "pending") {
@@ -398,6 +419,10 @@ export const processWithdrawalRequest = async (req, res) => {
     }).session(session);
 
     if (action === "approved") {
+      if (!balance) {
+        await session.abortTransaction();
+        return res.status(404).json({ message: "Balance record not found" });
+      }
       if (transaction.amount > balance.totalBalance) {
         await session.abortTransaction();
         return res.status(400).json({
@@ -497,7 +522,7 @@ try {
       <!-- Body -->
       <div style="padding:20px 24px 18px;">
         <p style="margin:0 0 10px;font-size:14px;color:#e5e7eb;">
-          Hi ${fullName || "there"},
+          Hi ${escapeHtml(fullName) || "there"},
         </p>
 
         <p style="margin:0 0 16px;font-size:14px;color:#e5e7eb;">
@@ -534,7 +559,7 @@ try {
               ? `<p style="margin:4px 0 0;">
                    <span style="font-weight:600;color:#d1d5db;">Note from admin:</span>
                    <span style="margin-left:6px;color:#e5e7eb;">
-                     ${adminComment}
+                     ${escapeHtml(adminComment)}
                    </span>
                  </p>`
               : ""
@@ -577,8 +602,7 @@ try {
     await session.abortTransaction();
     console.error("Withdrawal processing error:", error);
     return res.status(500).json({
-      message: "Error processing withdrawal request",
-      error: error.message,
+      message: "Error processing withdrawal request"
     });
   } finally {
     session.endSession();
@@ -613,8 +637,7 @@ export const getPendingWithdrawals = async (req, res) => {
   } catch (error) {
     console.error("Error retrieving pending withdrawals:", error);
     res.status(500).json({
-      message: "Error retrieving pending withdrawals",
-      error: error.message,
+      message: "Error retrieving pending withdrawals"
     });
   }
 };
@@ -623,15 +646,14 @@ export const getPendingWithdrawals = async (req, res) => {
 // In withdrawalController.js
 export const getUserWithdrawals = async (req, res) => {
   try {
-    const { email } = req.query;
     const { page = 1, limit = 10 } = req.query;
+    const email = typeof req.query.email === "string" ? req.query.email : "";
 
-    if (!email) {
-      return res.status(400).json({ message: "Email is required" });
-    }
+    // Non-admins can only see their own history
+    const targetEmail =
+      req.user.role === "admin" && email ? email : req.user.email;
 
-    // Find the user by email
-    const user = await User.findOne({ email: email.toLowerCase() });
+    const user = await User.findOne({ email: targetEmail.toLowerCase() });
 
     if (!user) {
       return res.status(404).json({
@@ -641,7 +663,7 @@ export const getUserWithdrawals = async (req, res) => {
 
     // Parse pagination values safely (JS, no type assertions)
     const numericPage = Number(page) || 1;
-    const numericLimit = Number(limit) || 10;
+    const numericLimit = Math.min(Number(limit) || 10, 100);
 
     // We want both withdrawals and admin credits
     const types = ["withdrawal", "ADMIN_ADD"];
@@ -671,8 +693,7 @@ export const getUserWithdrawals = async (req, res) => {
   } catch (error) {
     console.error("Error retrieving user withdrawals:", error);
     res.status(500).json({
-      message: "Error retrieving withdrawal history",
-      error: error.message,
+      message: "Error retrieving withdrawal history"
     });
   }
 };
@@ -716,8 +737,7 @@ export const getWithdrawalStats = async (req, res) => {
   } catch (error) {
     console.error("Error retrieving withdrawal statistics:", error);
     res.status(500).json({
-      message: "Error retrieving withdrawal statistics",
-      error: error.message,
+      message: "Error retrieving withdrawal statistics"
     });
   }
 };
@@ -790,8 +810,7 @@ export const getAllWithdrawals = async (req, res) => {
   } catch (error) {
     console.error("Error retrieving all withdrawals:", error);
     res.status(500).json({
-      message: "Error retrieving withdrawals",
-      error: error.message,
+      message: "Error retrieving withdrawals"
     });
   }
 };
@@ -799,10 +818,21 @@ export const getAllWithdrawals = async (req, res) => {
 // Get balance update history
 export const getBalanceHistory = async (req, res) => {
   try {
-    const { userId, startDate, endDate, page = 1, limit = 20 } = req.query;
+    const { startDate, endDate, page = 1, limit = 20 } = req.query;
+    const userId = typeof req.query.userId === "string" ? req.query.userId : undefined;
 
     const filter = {};
-    if (userId) filter.user = userId;
+    if (req.user.role === "admin") {
+      if (userId) {
+        if (!isValidId(userId)) {
+          return res.status(400).json({ message: "Invalid user id" });
+        }
+        filter.user = userId;
+      }
+    } else {
+      // Regular users only ever see their own history
+      filter.user = req.user._id;
+    }
     if (startDate || endDate) {
       filter.processedAt = {};
       if (startDate) filter.processedAt.$gte = new Date(startDate);
@@ -828,8 +858,7 @@ export const getBalanceHistory = async (req, res) => {
   } catch (error) {
     console.error("Error retrieving balance history:", error);
     res.status(500).json({
-      message: "Error retrieving balance history",
-      error: error.message,
+      message: "Error retrieving balance history"
     });
   }
 };

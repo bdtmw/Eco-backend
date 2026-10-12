@@ -4,19 +4,25 @@ import Transaction from '../model/withdrawals.js';
 import UserMAchine from '../model/UserMAchine.js';
 import User from "../model/UserModel.js";
 import asyncHandler from "express-async-handler";
+import { isSelfOrAdmin, isValidId, isPositiveNumber } from "../utils/access.js";
 
 export const updateBalance = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
 
   try {
-    console.log(">>> updateBalance called");
     const { userId, amount } = req.body;
 
     // VALIDATION
-    if (!amount || amount <= 0) {
+    if (!isPositiveNumber(amount)) {
       await session.abortTransaction();
+      session.endSession();
       return res.status(400).json({ message: "Invalid amount" });
+    }
+    if (!isValidId(userId) || !(await User.exists({ _id: userId }))) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({ message: "User not found" });
     }
 
     // FIND BALANCE RECORD
@@ -164,7 +170,7 @@ export const updateBalance = async (req, res) => {
     await session.abortTransaction();
     session.endSession();
     console.log(error);
-    return res.status(500).json({ message: "Error updating balance", error });
+    return res.status(500).json({ message: "Error updating balance" });
   }
 };
 
@@ -271,6 +277,10 @@ export const getBalance = async (req, res) => {
   try {
     const { userId } = req.params;
 
+    if (!isValidId(userId) || !isSelfOrAdmin(req, userId)) {
+      return res.status(403).json({ message: 'Not allowed' });
+    }
+
     let balance = await Balance.findOne({ user: userId });
     if (!balance) {
       try {
@@ -291,7 +301,7 @@ export const getBalance = async (req, res) => {
 
     const machineDetails = machines.map(m => ({
       machineId: m._id,
-      name: m.machine.machineName,
+      name: m.machine?.machineName,
       accumulatedProfit: m.monthlyProfitAccumulated || 0,
       lastProfitUpdate: m.lastProfitUpdate
     }));

@@ -4,6 +4,7 @@ import MiningMachine from '../../model/MiningMachine.js';
 import mongoose from 'mongoose';
 import { sendEmail } from '../../helper/emailServer.js';
 import User from '../../model/UserModel.js';
+import { isSelfOrAdmin, isValidId, isPositiveInt, escapeHtml } from '../../utils/access.js';
 
 
 
@@ -14,7 +15,7 @@ export const assignMachineToUser = async (req, res) => {
   try {
     const { userId, machineId, quantity = 1 } = req.body;
 
-    if (!userId || !machineId || quantity < 1) {
+    if (!isValidId(userId) || !isValidId(machineId) || !isPositiveInt(quantity) || quantity > 100) {
       await session.abortTransaction();
       session.endSession();
       return res.status(400).json({ message: 'User ID, Machine ID, and valid quantity are required' });
@@ -111,12 +112,12 @@ const html = `
         </h2>
 
         <p style="margin:0 0 10px 0;font-size:14px;color:#d1d5db;">
-          Hi ${emailData.userName || "there"},
+          Hi ${escapeHtml(emailData.userName) || "there"},
         </p>
         <p style="margin:0 0 18px 0;font-size:14px;color:#9ca3af;line-height:1.6;">
           You have been assigned new mining machine(s):
           <span style="color:#f9fafb;font-weight:600;">
-            ${emailData.machineName}
+            ${escapeHtml(emailData.machineName)}
           </span>.
           Your mining capacity has been updated in your dashboard.
         </p>
@@ -132,7 +133,7 @@ const html = `
           <p style="margin:0 0 6px 0;font-size:13px;color:#9ca3af;">
             <span style="color:#e5e7eb;font-weight:600;">Machine:</span>
             <span style="float:right;color:#f9fafb;font-weight:600;">
-              ${emailData.machineName}
+              ${escapeHtml(emailData.machineName)}
             </span>
           </p>
           <p style="margin:0 0 6px 0;font-size:13px;color:#9ca3af;clear:both;">
@@ -202,7 +203,7 @@ await sendEmail(
   } catch (error) {
     await session.abortTransaction();
     console.error('Machine assignment error:', error);
-    res.status(500).json({ message: 'Error assigning machines to user', error: error.message });
+    res.status(500).json({ message: 'Error assigning machines to user' });
   } finally {
     session.endSession();
   }
@@ -217,16 +218,15 @@ export const getUserMachines = async (req, res) => {
     }
 
     let user;
-    const isValidObjectId = mongoose.Types.ObjectId.isValid(userIdentifier);
-
-    if (isValidObjectId) {
+    if (isValidId(userIdentifier)) {
       user = await User.findById(userIdentifier);
-    } else {
-      user = await User.findOne({ email: userIdentifier });
+    } else if (typeof userIdentifier === 'string') {
+      user = await User.findOne({ email: userIdentifier.toLowerCase() });
     }
 
-    if (!user) {
-      return res.status(404).json({ message: 'User not found', identifier: userIdentifier });
+    // Same response for "missing" and "not yours" to avoid user enumeration
+    if (!user || !isSelfOrAdmin(req, user._id)) {
+      return res.status(404).json({ message: 'User not found' });
     }
 
     const userMachines = await UserMachine.find({ user: user._id })
@@ -236,7 +236,7 @@ export const getUserMachines = async (req, res) => {
     res.status(200).json(userMachines.length === 0 ? [] : userMachines);
   } catch (error) {
     console.error('Error retrieving user machines:', error);
-    res.status(500).json({ message: 'Error retrieving user machines', error: error.message });
+    res.status(500).json({ message: 'Error retrieving user machines' });
   }
 };
 

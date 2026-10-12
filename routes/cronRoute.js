@@ -1,14 +1,18 @@
 // routes/cronRoute.js
 import express from 'express';
+import crypto from 'crypto';
 import { runProfitUpdate } from '../cronJobs.js';
 
 const router = express.Router();
 
 router.get('/cron/profit-update', async (req, res) => {
   // 🔒 Security: verify secret token
-  const secret = req.headers['x-cron-secret'] || req.query.secret;
-  
-  if (secret !== process.env.CRON_SECRET) {
+  const expected = process.env.CRON_SECRET;
+  const secret = req.headers['x-cron-secret'];
+  const a = Buffer.from(String(secret || ''));
+  const b = Buffer.from(String(expected || ''));
+
+  if (!expected || a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
     console.warn('[CRON] ❌ Unauthorized attempt from:', req.ip);
     return res.status(401).json({ error: 'Unauthorized' });
   }
@@ -19,7 +23,7 @@ router.get('/cron/profit-update', async (req, res) => {
     res.json({ success: true, ...result });
   } catch (err) {
     console.error('[CRON] ❌ Failed:', err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Profit update failed' });
   }
 });
 

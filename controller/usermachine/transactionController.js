@@ -6,6 +6,7 @@ import Transaction from "../../model/withdrawals.js";
 import Balance from "../../model/Balance.js";
 import mongoose from "mongoose";
 import { sendEmail } from "../../helper/emailServer.js";
+import { isSelfOrAdmin, isValidId, isPositiveInt } from "../../utils/access.js";
 
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 1000;
@@ -54,11 +55,13 @@ const executeTransactionWithRetry = async (transactionFunction) => {
 
 export const purchaseAndAssignMachine = async (req, res) => {
   try {
-    const { userId, machineId, quantity = 1 } = req.body;
+    const { machineId, quantity = 1 } = req.body;
+    // Always purchase for the authenticated user, never a client-supplied id
+    const userId = req.user._id;
 
-    if (!userId || !machineId || quantity < 1) {
+    if (!isValidId(machineId) || !isPositiveInt(quantity) || quantity > 100) {
       return res.status(400).json({
-        message: "User ID, Machine ID, and valid quantity are required",
+        message: "Machine ID and a valid integer quantity are required",
       });
     }
 
@@ -82,7 +85,8 @@ export const purchaseAndAssignMachine = async (req, res) => {
 
       const totalCost = machine.priceRange * quantity;
 
-      if (balance.totalBalance < totalCost) {
+      // Purchases are paid from the deposited balance (adminAdd)
+      if (balance.adminAdd < totalCost) {
         throw new Error("Insufficient balance");
       }
 
@@ -170,7 +174,8 @@ export const purchaseAndAssignMachine = async (req, res) => {
           const bonusPercentage = purchaseCount === 0 ? 0.10 : 0.02;
           const bonusAmount = +(totalCost * bonusPercentage).toFixed(2);
 
-          referralBalance.totalBalance += bonusAmount;
+          referralBalance.adminAdd += bonusAmount;
+          referralBalance.totalBalance = referralBalance.adminAdd + referralBalance.miningBalance;
           referralBalance.lastUpdated = new Date();
           await referralBalance.save({ session });
 
@@ -223,8 +228,9 @@ export const purchaseAndAssignMachine = async (req, res) => {
   } catch (error) {
     console.error("Machine purchase error:", error);
     return res.status(400).json({
-      message: "Error purchasing machines",
-      error: error.message,
+      message: error.message === "Insufficient balance"
+        ? "Insufficient balance"
+        : "Error purchasing machines",
     });
   }
 };
@@ -234,45 +240,42 @@ export const purchaseAndAssignMachine = async (req, res) => {
 
 export const checkPurchaseEligibility = async (req, res) => {
   try {
-    const { userId, machineId, quantity = 1 } = req.query;
+    const { machineId } = req.query;
+    const quantity = Number(req.query.quantity ?? 1);
 
-    if (!userId || !machineId) {
+    if (!isValidId(machineId) || !isPositiveInt(quantity)) {
       return res
         .status(400)
-        .json({ message: "User ID and Machine ID are required" });
+        .json({ message: "Valid Machine ID and quantity are required" });
     }
 
-    const user = await User.findById(userId);
-    const machine = await MiningMachine.findById(machineId);
-
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
+    const [machine, balance] = await Promise.all([
+      MiningMachine.findById(machineId),
+      Balance.findOne({ user: req.user._id }),
+    ]);
 
     if (!machine) {
       return res.status(404).json({ message: "Machine not found" });
     }
 
+    const available = balance?.adminAdd || 0;
     const totalCost = machine.priceRange * quantity;
-    const canAfford = user.adminAdd >= totalCost;
+    const canAfford = available >= totalCost;
 
     res.status(200).json({
       canPurchase: canAfford,
-      userBalance: user.adminAdd,
+      userBalance: available,
       requiredAmount: totalCost,
-      shortfall: canAfford ? 0 : totalCost - user.adminAdd,
+      shortfall: canAfford ? 0 : totalCost - available,
       machine: {
         name: machine.machineName,
         pricePerUnit: machine.priceRange,
-        quantity: quantity,
+        quantity,
       },
     });
   } catch (error) {
     console.error("Eligibility check error:", error);
-    res.status(500).json({
-      message: "Error checking purchase eligibility",
-      error: error.message,
-    });
+    res.status(500).json({ message: "Error checking purchase eligibility" });
   }
 };
 
@@ -283,12 +286,17 @@ export const sellUserMachine = async (req, res) => {
   try {
     const { userMachineId } = req.params;
 
+    if (!isValidId(userMachineId)) {
+      await session.abortTransaction();
+      return res.status(400).json({ message: "Invalid machine id" });
+    }
+
     const userMachine = await UserMachine.findById(userMachineId)
       .populate("user")
       .populate("machine")
       .session(session);
 
-    if (!userMachine) {
+    if (!userMachine || !isSelfOrAdmin(req, userMachine.user?._id)) {
       await session.abortTransaction();
       return res.status(404).json({ message: "User machine not found" });
     }
@@ -298,7 +306,8 @@ export const sellUserMachine = async (req, res) => {
       return res.status(400).json({ message: "Cannot sell inactive machine" });
     }
 
-    const originalPrice = userMachine.machine.priceRange;
+    // Use the price recorded at assignment time, not the current catalog price
+    const originalPrice = userMachine.priceRange ?? userMachine.machine.priceRange;
     const sellingPrice = originalPrice * 0.9;
     const deduction = originalPrice * 0.1;
 
@@ -378,7 +387,7 @@ export const sellUserMachine = async (req, res) => {
     console.error("Machine sale error:", error);
     return res
       .status(500)
-      .json({ message: "Error processing machine sale", error: error.message });
+      .json({ message: "Error processing machine sale" });
   } finally {
     session.endSession();
   }
@@ -387,6 +396,10 @@ export const sellUserMachine = async (req, res) => {
 export const getSaleHistory = async (req, res) => {
   try {
     const { userId } = req.params;
+
+    if (!isValidId(userId) || !isSelfOrAdmin(req, userId)) {
+      return res.status(403).json({ message: "Not allowed" });
+    }
 
     const sales = await Transaction.find({
       user: userId,
@@ -409,6 +422,6 @@ export const getSaleHistory = async (req, res) => {
     console.error("Error fetching sale history:", error);
     return res
       .status(500)
-      .json({ message: "Error retrieving sale history", error: error.message });
+      .json({ message: "Error retrieving sale history" });
   }
 };

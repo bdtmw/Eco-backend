@@ -19,6 +19,6 @@ router.get('/user-shares/:userId', protect, getUserShareDetails);
 router.post('/sell/:sharePurchaseId', protect, sellSharePurchase); // Add new route for selling shares
 
 // Admin only routes
-router.post('/update-profits', adminMiddleware, updateAllShareProfits);
+router.post('/update-profits', protect, adminMiddleware, updateAllShareProfits);
 
 export default router;
