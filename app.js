@@ -54,7 +54,10 @@ const corsOptions = {
 app.use(cors(corsOptions));
 
 // Basic security headers
-app.set("trust proxy", 1);
+// Number of reverse proxies in front of the app (Vercel = 1; Cloudflare + cPanel = 2).
+// Used for req.ip, which the rate limiter keys on.
+const trustProxy = Number(process.env.TRUST_PROXY ?? 1);
+app.set("trust proxy", Number.isNaN(trustProxy) ? 1 : trustProxy);
 app.disable("x-powered-by");
 app.use((req, res, next) => {
   res.set({
