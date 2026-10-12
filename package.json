@@ -5,7 +5,9 @@
   "main": "server.js",
   "type": "module",
   "scripts": {
-    "start": "nodemon server"
+    "start": "nodemon server",
+    "test": "cross-env NODE_OPTIONS=--experimental-vm-modules jest --runInBand --forceExit",
+    "test:security": "cross-env NODE_OPTIONS=--experimental-vm-modules jest --runInBand --forceExit tests/security.test.js"
   },
   "author": "",
   "license": "ISC",
@@ -32,5 +34,20 @@
     "nodemailer": "^6.9.15",
     "nodemon": "^3.1.4",
     "tronweb": "^6.1.1"
+  },
+  "devDependencies": {
+    "cross-env": "^10.1.0",
+    "jest": "^30.5.2",
+    "mongodb-memory-server": "^11.3.0",
+    "supertest": "^7.3.1"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "transform": {},
+    "testTimeout": 60000,
+    "testMatch": [
+      "**/tests/**/*.test.js"
+    ],
+    "silent": true
   }
 }
